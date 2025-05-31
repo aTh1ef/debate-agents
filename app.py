@@ -1,7 +1,7 @@
 import streamlit as st
 import asyncio
 import aiohttp
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TypedDict, Annotated, Literal
 from dataclasses import dataclass
 from enum import Enum
 import json
@@ -15,32 +15,64 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import openai
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
 import pandas as pd
+import operator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration - Optimized for lower-end hardware
+def check_dependencies():
+    """Check if all required dependencies are available"""
+    try:
+        import langgraph
+        import langchain_core
+        return True
+    except ImportError as e:
+        st.error(f"Missing dependencies: {str(e)}")
+        st.error("Please install: pip install langgraph langchain-core")
+        return False
+
+class GraphState(TypedDict):
+    """LangGraph state that gets passed between nodes"""
+    claim: str
+    urls: List[str]
+    scraped_content: List[Dict[str, Any]]
+    verifier_arguments: Annotated[List[str], operator.add]  # Automatically accumulates
+    opposer_arguments: Annotated[List[str], operator.add]  # Automatically accumulates
+    current_round: int
+    max_rounds: int
+    final_judgment: Optional[Dict[str, Any]]
+    messages: Annotated[List[BaseMessage], operator.add]  # Message history
+    next_action: str
+    round_complete: bool
+    error_message: Optional[str]
+    debate_complete: bool
+    retry_count: int  # Track retry attempts
+    last_error_node: Optional[str]  # Track which node failed
+
+# Configuration - Optimized for better responses
 LM_STUDIO_BASE_URL = "http://localhost:1234/v1"
-# Using smaller, more efficient models
-PHI_MODEL = "microsoft/phi-4-mini-reasoning"  # Correct model ID
-GEMMA_MODEL = "google/gemma-3-4b"  # Correct model ID
+# Using specific LM Studio model names
+QWEN_MODEL = "qwen/qwen3-1.7b"  # For Verifier and Counter-Explainer
+PHI_MODEL = "microsoft/phi-4-mini-reasoning"  # For Judge
 # Alternative lightweight models
 FALLBACK_MODEL = "microsoft/DialoGPT-small"  # Backup option
 
-# Memory optimization settings
-MAX_CONTENT_LENGTH = 2000  # Reduced from 5000
-MAX_FULL_TEXT_LENGTH = 3000  # Reduced from 10000
-MAX_RESPONSE_TOKENS = 500  # Reduced from 800-1000
+# Updated configuration with much higher token limits
+MAX_RESPONSE_TOKENS = 4096  # Significantly increased for fuller responses
+MAX_CONTENT_LENGTH = 8000  # Increased to allow more content per source
+MAX_FULL_TEXT_LENGTH = 12000  # Increased for fuller text processing
 
 class AgentRole(Enum):
     VERIFIER = "verifier"
-    OPPOSER = "opposer"
+    COUNTER_EXPLAINER = "counter_explainer"
     JUDGE = "judge"
 
 @dataclass
@@ -153,30 +185,91 @@ class LMStudioClient:
     
     def generate_response(self, model: str, messages: List[Dict[str, str]], 
                          temperature: float = 0.7, max_tokens: int = MAX_RESPONSE_TOKENS) -> str:
-        """Generate response using specified model with memory optimization"""
+        """Generate response using specified model with improved context management"""
         try:
-            # Truncate messages if too long to save memory
-            truncated_messages = []
+            # Better context management - keep essential context while truncating excess
+            processed_messages = []
             for msg in messages:
                 content = msg['content']
-                if len(content) > 3000:  # Truncate very long prompts
-                    content = content[:3000] + "...[truncated for memory efficiency]"
-                truncated_messages.append({
+                # More intelligent truncation that preserves structure
+                if len(content) > 8000:  # Increased from 4000
+                    # Try to preserve key sections
+                    lines = content.split('\n')
+                    preserved_lines = []
+                    char_count = 0
+                    
+                    for line in lines:
+                        if char_count + len(line) > 7500:  # Increased from 3500
+                            preserved_lines.append("...[content truncated for context management]...")
+                            break
+                        preserved_lines.append(line)
+                        char_count += len(line)
+                    
+                    content = '\n'.join(preserved_lines)
+                
+                processed_messages.append({
                     'role': msg['role'],
                     'content': content
                 })
             
             response = self.client.chat.completions.create(
                 model=model,
-                messages=truncated_messages,
+                messages=processed_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                stream=False
+                stream=False,
+                # Adjusted parameters for better output
+                top_p=0.95,  # Slightly increased for more diverse responses
+                frequency_penalty=0.2,  # Increased to reduce repetition
+                presence_penalty=0.2  # Increased to encourage more original content
             )
-            return response.choices[0].message.content
+            
+            result = response.choices[0].message.content
+            
+            # Validate response quality
+            if not self._validate_response(result):
+                logger.warning("Generated response failed validation, attempting regeneration...")
+                # Try once more with lower temperature for more focused response
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=processed_messages,
+                    temperature=0.5,
+                    max_tokens=max_tokens,
+                    stream=False,
+                    top_p=0.9
+                )
+                result = response.choices[0].message.content
+            
+            return result
+            
         except Exception as e:
             logger.error(f"Error generating response with {model}: {str(e)}")
             return f"Error: Could not generate response. Please ensure LM Studio is running and the model {model} is loaded."
+    
+    def _validate_response(self, response: str) -> bool:
+        """Validate response quality and coherence"""
+        if not response or len(response.strip()) < 50:
+            return False
+        
+        # Check for repetitive patterns
+        words = response.lower().split()
+        if len(words) > 10:
+            word_freq = {}
+            for word in words:
+                word_freq[word] = word_freq.get(word, 0) + 1
+            
+            # Flag if any word appears more than 20% of the time
+            max_freq = max(word_freq.values())
+            if max_freq > len(words) * 0.2:
+                return False
+        
+        # Check for incomplete sentences
+        sentences = response.split('.')
+        incomplete_sentences = sum(1 for s in sentences if len(s.strip()) < 10 and s.strip())
+        if incomplete_sentences > len(sentences) * 0.3:
+            return False
+        
+        return True
 
 class DebateAgent:
     """Base class for debate agents"""
@@ -193,520 +286,1119 @@ class DebateAgent:
         raise NotImplementedError
 
 class VerifierAgent(DebateAgent):
-    """Agent that argues in favor of the claim"""
+    """Agent that argues in favor of the claim with improved prompting"""
     
     def generate_argument(self, claim: str, evidence: List[Dict[str, Any]], 
                          opponent_arguments: List[str] = None, round_num: int = 1) -> str:
         
-        evidence_text = "\n\n".join([
-            f"Source: {item['title']}\nURL: {item['url']}\nContent: {item['content']}"
-            for item in evidence if item['status'] == 'success'
-        ])
+        # Better evidence processing
+        evidence_text = self._process_evidence(evidence)
+        opponent_context = self._process_opponent_arguments(opponent_arguments, "Counter-Explainer")
         
-        opponent_context = ""
-        if opponent_arguments:
-            opponent_context = f"\n\nOpponent's previous arguments:\n{chr(10).join(opponent_arguments)}"
-        
-        prompt = f"""You are a skilled debater arguing that the following claim is TRUE:
-CLAIM: {claim}
+        # More structured and specific prompt
+        prompt = f"""You are a skilled fact-checker and debater. Your role is to present a strong, evidence-based argument supporting this claim:
 
-EVIDENCE FROM WEB SOURCES:
+CLAIM TO SUPPORT: "{claim}"
+
+AVAILABLE EVIDENCE:
 {evidence_text}
 
 {opponent_context}
 
-Round {round_num}: Present a strong, evidence-based argument supporting the claim. Use specific facts, quotes, and logical reasoning. Be persuasive but factual. Focus on:
-1. Direct evidence supporting the claim
-2. Credible sources and expert opinions
-3. Counter-arguments to opposition points (if any)
-4. Logical reasoning chain
+TASK FOR ROUND {round_num}:
+Write a focused argument that SUPPORTS the claim. Your response must:
 
-Provide a structured argument in 1-2 paragraphs (keep concise for efficiency)."""
+1. START with a clear thesis statement about why the claim is true
+2. PRESENT 2-3 specific pieces of evidence from the sources
+3. USE direct quotes or facts from the evidence (cite sources)
+4. ADDRESS any counter-arguments raised by the opponent (if any)
+5. END with a strong concluding statement
+
+REQUIREMENTS:
+- Keep your argument between 400-800 words
+- Use logical reasoning and evidence-based arguments
+- Stay focused on supporting the claim
+- Be persuasive but factual
+- Do not repeat previous arguments unless building upon them
+
+Write your argument now:"""
 
         messages = [
-            {"role": "system", "content": "You are an expert debater and fact-checker who argues for the truth of claims using evidence and logical reasoning."},
+            {
+                "role": "system", 
+                "content": """You are an expert fact-checker and debater specializing in evidence-based argumentation. You present clear, logical arguments supporting claims using credible sources. Always stay on topic and provide structured, coherent responses. Focus on quality over quantity."""
+            },
             {"role": "user", "content": prompt}
         ]
         
-        return self.client.generate_response(self.model, messages, temperature=0.7, max_tokens=800)
+        return self.client.generate_response(self.model, messages, temperature=0.6, max_tokens=2048)
+    
+    def _process_evidence(self, evidence: List[Dict[str, Any]]) -> str:
+        """Process evidence into a clean, structured format"""
+        if not evidence:
+            return "No evidence available."
+        
+        processed = []
+        for i, item in enumerate(evidence[:5]):  # Limit to top 5 sources
+            if item.get('status') == 'success':
+                title = item.get('title', 'Unknown Source')[:200]  # Increased from 100
+                url = item.get('url', '')
+                content = item.get('content', '')[:2000]  # Increased from 800
+                
+                processed.append(f"""SOURCE {i+1}: {title}
+URL: {url}
+CONTENT: {content}
+---""")
+        
+        return '\n\n'.join(processed) if processed else "No valid evidence found."
+    
+    def _process_opponent_arguments(self, arguments: List[str], opponent_name: str) -> str:
+        """Process opponent arguments for context"""
+        if not arguments:
+            return ""
+        
+        formatted_args = []
+        for i, arg in enumerate(arguments[-2:]):  # Only use last 2 arguments to avoid token overflow
+            formatted_args.append(f"{opponent_name} Argument {i+1}: {arg[:1000]}...")  # Increased from 500
+        
+        return f"\n\nPREVIOUS {opponent_name.upper()} ARGUMENTS:\n" + '\n\n'.join(formatted_args)
 
-class OpposerAgent(DebateAgent):
-    """Agent that argues against the claim"""
+class CounterExplainerAgent(DebateAgent):
+    """Agent that provides alternative explanations with improved prompting"""
     
     def generate_argument(self, claim: str, evidence: List[Dict[str, Any]], 
                          opponent_arguments: List[str] = None, round_num: int = 1) -> str:
         
-        evidence_text = "\n\n".join([
-            f"Source: {item['title']}\nURL: {item['url']}\nContent: {item['content']}"
-            for item in evidence if item['status'] == 'success'
-        ])
+        evidence_text = self._process_evidence(evidence)
+        verifier_context = self._process_opponent_arguments(opponent_arguments, "Verifier")
         
-        opponent_context = ""
-        if opponent_arguments:
-            opponent_context = f"\n\nVerifier's previous arguments:\n{chr(10).join(opponent_arguments)}"
-        
-        prompt = f"""You are a skilled debater arguing that the following claim is FALSE or QUESTIONABLE:
-CLAIM: {claim}
+        # More structured prompt with clear role definition
+        prompt = f"""You are a thoughtful analyst providing balanced perspective on complex topics. Your role is to offer nuanced analysis and alternative viewpoints.
 
-EVIDENCE FROM WEB SOURCES:
+CLAIM BEING DISCUSSED: "{claim}"
+
+AVAILABLE EVIDENCE:
 {evidence_text}
 
-{opponent_context}
+{verifier_context}
 
-Round {round_num}: Present a strong argument challenging the claim. Look for:
-1. Contradictory evidence in the sources
-2. Lack of sufficient evidence
-3. Biased or unreliable sources
-4. Logical fallacies or weak reasoning
-5. Alternative explanations
+TASK FOR ROUND {round_num}:
+Provide a balanced analysis that adds depth and nuance to the discussion. Your response should:
 
-Be critical but fair. Use evidence-based reasoning. Provide a structured counter-argument in 1-2 paragraphs (keep concise)."""
+1. START with acknowledgment of any valid points from the Verifier
+2. IDENTIFY alternative explanations or interpretations of the evidence
+3. HIGHLIGHT important context or background information that adds nuance
+4. POINT OUT any limitations, uncertainties, or missing perspectives
+5. SUGGEST additional factors that should be considered
+6. END with a balanced summary of the complexity involved
+
+APPROACH:
+- Be constructive and analytical, not simply oppositional
+- Focus on adding depth rather than just disagreeing
+- Use evidence to support alternative interpretations
+- Acknowledge uncertainties and complexities
+- Maintain intellectual honesty
+
+REQUIREMENTS:
+- Keep response between 500-1000 words
+- Stay focused and avoid repetition
+- Provide substantive analysis
+- Be respectful of different viewpoints
+
+Write your analysis now:"""
 
         messages = [
-            {"role": "system", "content": "You are a critical thinker and skeptical debater who challenges claims by finding weaknesses in evidence and reasoning."},
+            {
+                "role": "system", 
+                "content": """You are a thoughtful analyst who provides nuanced perspectives on complex topics. You excel at identifying alternative explanations, adding important context, and highlighting the complexity of issues. You are constructive and balanced, seeking to enrich understanding rather than simply oppose. Always provide substantive, well-reasoned analysis."""
+            },
             {"role": "user", "content": prompt}
         ]
         
-        return self.client.generate_response(self.model, messages, temperature=0.7, max_tokens=800)
+        return self.client.generate_response(self.model, messages, temperature=0.7, max_tokens=2048)
+    
+    def _process_evidence(self, evidence: List[Dict[str, Any]]) -> str:
+        """Process evidence into a clean, structured format"""
+        if not evidence:
+            return "No evidence available."
+        
+        processed = []
+        for i, item in enumerate(evidence[:5]):
+            if item.get('status') == 'success':
+                title = item.get('title', 'Unknown Source')[:100]
+                url = item.get('url', '')
+                content = item.get('content', '')[:800]
+                
+                processed.append(f"""SOURCE {i+1}: {title}
+URL: {url}
+CONTENT: {content}
+---""")
+        
+        return '\n\n'.join(processed) if processed else "No valid evidence found."
+    
+    def _process_opponent_arguments(self, arguments: List[str], opponent_name: str) -> str:
+        """Process opponent arguments for context"""
+        if not arguments:
+            return ""
+        
+        formatted_args = []
+        for i, arg in enumerate(arguments[-2:]):
+            formatted_args.append(f"{opponent_name} Argument {i+1}: {arg[:500]}...")
+        
+        return f"\n\nPREVIOUS {opponent_name.upper()} ARGUMENTS TO ANALYZE:\n" + '\n\n'.join(formatted_args)
 
 class JudgeAgent(DebateAgent):
-    """Agent that evaluates the debate and makes final judgment"""
+    """Agent that provides comprehensive debate analysis with anti-hallucination measures"""
     
     def make_judgment(self, claim: str, evidence: List[Dict[str, Any]], 
-                     verifier_arguments: List[str], opposer_arguments: List[str]) -> Dict[str, Any]:
+                     verifier_arguments: List[str], counter_explainer_arguments: List[str]) -> str:
         
-        evidence_text = "\n\n".join([
-            f"Source: {item['title']}\nURL: {item['url']}\nContent: {item['content'][:1000]}"
-            for item in evidence if item['status'] == 'success'
-        ])
+        # Validate inputs first
+        if not verifier_arguments or not counter_explainer_arguments:
+            return "Insufficient debate content to analyze. At least one argument from each side is required."
         
-        verifier_text = "\n\n".join([f"Verifier Argument {i+1}: {arg}" for i, arg in enumerate(verifier_arguments)])
-        opposer_text = "\n\n".join([f"Opposer Argument {i+1}: {arg}" for i, arg in enumerate(opposer_arguments)])
+        evidence_summary = self._summarize_evidence_safely(evidence)
+        verifier_summary = self._summarize_arguments_safely(verifier_arguments, "Verifier")
+        counter_explainer_summary = self._summarize_arguments_safely(counter_explainer_arguments, "Counter-Explainer")
         
-        # Simplified prompt for better JSON generation
-        prompt = f"""You are an impartial judge evaluating a debate about this claim: {claim}
+        # More constrained and specific prompt to prevent hallucination
+        prompt = f"""You are analyzing a structured debate. Provide ONLY factual analysis based on the provided content.
 
-EVIDENCE SUMMARY:
-{evidence_text[:1500]}
+CLAIM BEING ANALYZED: "{claim}"
 
-VERIFIER'S ARGUMENTS (Supporting the claim):
-{verifier_text[:1000]}
+EVIDENCE PROVIDED:
+{evidence_summary}
 
-OPPOSER'S ARGUMENTS (Challenging the claim):
-{opposer_text[:1000]}
+VERIFIER ARGUMENTS (supporting the claim):
+{verifier_summary}
 
-Judge the claim and respond ONLY with valid JSON in this format:
-{{
-    "verdict": "TRUE",
-    "confidence": 0.8,
-    "reasoning": "Brief explanation here",
-    "key_evidence": ["evidence point 1", "evidence point 2"],
-    "verifier_score": 7,
-    "opposer_score": 6,
-    "evidence_quality": "STRONG"
-}}
+COUNTER-EXPLAINER ARGUMENTS (providing alternative perspectives):
+{counter_explainer_summary}
 
-Choose verdict from: TRUE, FALSE, or INSUFFICIENT_EVIDENCE
-Choose evidence_quality from: STRONG, MODERATE, or WEAK
-Use confidence from 0.0 to 1.0
-Use scores from 0 to 10"""
+STRICT INSTRUCTIONS:
+1. Analyze ONLY the arguments and evidence provided above
+2. Do NOT add information not present in the source material
+3. Do NOT make assumptions about facts not stated
+4. Quote directly from the arguments when referencing specific points
+5. If something is unclear or missing, explicitly state that
+
+REQUIRED ANALYSIS FORMAT:
+1. ARGUMENT SUMMARY: Briefly summarize what each side actually argued (quote key phrases)
+2. EVIDENCE ASSESSMENT: Evaluate only the evidence sources that were actually provided
+3. LOGICAL ANALYSIS: Compare the reasoning quality of both sides' actual arguments
+4. GAPS IDENTIFIED: What information or reasoning is missing from both sides?
+
+Keep your analysis factual and grounded in the provided content only. Do not speculate beyond what was presented."""
 
         messages = [
-            {"role": "system", "content": "You are an impartial judge. Always respond with valid JSON only."},
+            {
+                "role": "system", 
+                "content": """You are a factual debate analyst. You analyze only the content provided to you without adding external information. You quote directly from source material and explicitly note when information is missing or unclear. You never invent facts, quotes, or evidence that wasn't provided to you. If you cannot make a determination based on provided content, you state this clearly."""
+            },
+            {"role": "user", "content": prompt}
+        ]
+        
+        # Use lower temperature for more focused, less creative responses
+        response = self.client.generate_response(self.model, messages, temperature=0.2, max_tokens=1200)
+        
+        # Validate the response doesn't contain obvious hallucinations
+        validated_response = self._validate_judge_response(response, verifier_arguments, counter_explainer_arguments, evidence)
+        
+        return validated_response
+    
+    def _validate_judge_response(self, response: str, verifier_args: List[str], counter_args: List[str], evidence: List[Dict[str, Any]]) -> str:
+        """Validate judge response against source material to catch hallucinations"""
+        
+        # Check for common hallucination patterns
+        suspicious_phrases = [
+            "according to studies", "research shows", "experts say", "it is well known",
+            "statistics indicate", "data suggests", "multiple sources confirm"
+        ]
+        
+        # Flag potential hallucinations
+        warnings = []
+        response_lower = response.lower()
+        
+        for phrase in suspicious_phrases:
+            if phrase in response_lower:
+                # Check if this phrase appears in source material
+                found_in_sources = False
+                all_source_text = ""
+                
+                # Combine all source material
+                for arg in verifier_args + counter_args:
+                    all_source_text += arg.lower() + " "
+                
+                for item in evidence:
+                    if item.get('content'):
+                        all_source_text += item['content'].lower() + " "
+                
+                if phrase not in all_source_text:
+                    warnings.append(f"Response contains '{phrase}' but this wasn't in source material")
+        
+        # If warnings found, add disclaimer
+        if warnings:
+            disclaimer = "\n\n[ANALYSIS NOTE: This response may contain information not directly present in the provided source material. The analysis should be verified against the original arguments and evidence.]"
+            response += disclaimer
+        
+        return response
+    
+    def _summarize_evidence_safely(self, evidence: List[Dict[str, Any]]) -> str:
+        """Safely summarize evidence without adding external information"""
+        if not evidence:
+            return "No evidence sources were provided for analysis."
+        
+        successful_sources = [e for e in evidence if e.get('status') == 'success']
+        failed_sources = len(evidence) - len(successful_sources)
+        
+        if not successful_sources:
+            return f"All {len(evidence)} evidence sources failed to load successfully. No content available for analysis."
+        
+        summary = f"Successfully loaded {len(successful_sources)} out of {len(evidence)} evidence sources:\n\n"
+        
+        for i, source in enumerate(successful_sources[:3]):  # Limit to prevent context overflow
+            title = source.get('title', 'No title available')[:80]
+            url = source.get('url', 'No URL')
+            content_preview = source.get('content', 'No content')[:300]
+            
+            summary += f"SOURCE {i+1}:\n"
+            summary += f"Title: {title}\n"
+            summary += f"URL: {url}\n"
+            summary += f"Content Preview: {content_preview}...\n\n"
+        
+        if len(successful_sources) > 3:
+            summary += f"[{len(successful_sources) - 3} additional sources not shown in detail]\n"
+        
+        return summary
+    
+    def _summarize_arguments_safely(self, arguments: List[str], role_name: str) -> str:
+        """Safely summarize arguments without adding interpretation"""
+        if not arguments:
+            return f"{role_name}: No arguments were presented during the debate."
+        
+        summary = f"{role_name.upper()} PRESENTED {len(arguments)} ARGUMENT(S):\n\n"
+        
+        for i, arg in enumerate(arguments):
+            # Preserve the actual argument content without interpretation
+            summary += f"ROUND {i+1} ARGUMENT:\n{arg}\n\n"
+        
+        return summary
+
+class ScoringAgent:
+    """Enhanced scoring agent with strict anti-hallucination measures"""
+    
+    def __init__(self, client: LMStudioClient, model: str):
+        self.client = client
+        self.model = model
+    
+    def score_debate(self, judge_summary: str, claim: str) -> Dict[str, Any]:
+        """Convert judge summary into structured verdict with strict validation"""
+        
+        prompt = f"""Convert the judge's analysis into a structured verdict. Base your scoring ONLY on the judge's actual analysis.
+
+ORIGINAL CLAIM: "{claim}"
+
+JUDGE'S ANALYSIS (USE ONLY THIS INFORMATION):
+{judge_summary}
+
+TASK: Create a JSON verdict based SOLELY on the judge's analysis above.
+
+STRICT RULES:
+- Use ONLY information present in the judge's analysis
+- Do NOT add external knowledge or assumptions
+- If the judge's analysis is unclear, use "INSUFFICIENT_EVIDENCE"
+- Base confidence on how clearly the judge reached conclusions
+- Quote directly from the judge's analysis for reasoning
+
+OUTPUT ONLY THIS JSON FORMAT:
+{{
+    "verdict": "TRUE/FALSE/INSUFFICIENT_EVIDENCE",
+    "confidence": 0.0-1.0,
+    "reasoning": "Brief summary based only on judge's analysis",
+    "evidence_quality": "STRONG/MODERATE/WEAK",
+    "winning_side": "verifier/counter_explainer/tie"
+}}
+
+JSON OUTPUT:"""
+
+        messages = [
+            {
+                "role": "system", 
+                "content": "You convert judge analyses into structured JSON verdicts. You use ONLY the information provided in the judge's analysis. You never add external information or make assumptions beyond what the judge stated. Output valid JSON only."
+            },
             {"role": "user", "content": prompt}
         ]
         
         try:
-            response = self.client.generate_response(self.model, messages, temperature=0.3, max_tokens=1000)
+            # Use very low temperature to minimize creativity/hallucination
+            response = self.client.generate_response(self.model, messages, temperature=0.1, max_tokens=600)
             
-            # Enhanced JSON extraction
-            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response, re.DOTALL)
-            if json_match:
-                judgment = json.loads(json_match.group())
-                
-                # Validate required fields
-                required_fields = ['verdict', 'confidence', 'reasoning', 'key_evidence', 'verifier_score', 'opposer_score', 'evidence_quality']
-                for field in required_fields:
-                    if field not in judgment:
-                        raise KeyError(f"Missing field: {field}")
-                        
-                # Validate verdict values
-                if judgment['verdict'] not in ['TRUE', 'FALSE', 'INSUFFICIENT_EVIDENCE']:
-                    judgment['verdict'] = 'INSUFFICIENT_EVIDENCE'
-                    
-                # Validate numeric ranges
-                judgment['confidence'] = max(0.0, min(1.0, float(judgment['confidence'])))
-                judgment['verifier_score'] = max(0, min(10, int(judgment['verifier_score'])))
-                judgment['opposer_score'] = max(0, min(10, int(judgment['opposer_score'])))
-                
-                return judgment
+            # Enhanced JSON extraction with validation
+            verdict = self._extract_and_validate_json(response, judge_summary)
+            if verdict:
+                return self._validate_verdict_against_source(verdict, judge_summary)
                 
         except Exception as e:
-            logger.error(f"Error parsing judgment: {str(e)}")
-            logger.error(f"Raw response: {response}")
+            logger.error(f"Error parsing scoring response: {str(e)}")
         
-        # Fallback judgment with detailed reasoning
-        fallback_reasoning = f"Unable to generate proper judgment due to model limitations. Based on available evidence, the claim '{claim}' requires further analysis."
+        # Enhanced fallback scoring based only on judge's actual text
+        return self._create_evidence_based_fallback(judge_summary, claim)
+    
+    def _extract_and_validate_json(self, response: str, judge_summary: str) -> Dict[str, Any]:
+        """Extract JSON and validate against source material"""
+        verdict = self._extract_json_verdict(response)
+        if not verdict:
+            return None
         
-        if len(verifier_arguments) > len(opposer_arguments):
+        # Validate that reasoning is grounded in judge's analysis
+        reasoning = verdict.get('reasoning', '')
+        if reasoning and len(reasoning) > 50:
+            # Check if reasoning contains concepts actually mentioned in judge summary
+            judge_lower = judge_summary.lower()
+            reasoning_lower = reasoning.lower()
+            
+            # Flag if reasoning contains terms not in judge summary
+            key_terms = reasoning_lower.split()
+            unfounded_terms = 0
+            
+            for term in key_terms:
+                if len(term) > 4 and term not in judge_lower:  # Skip short common words
+                    unfounded_terms += 1
+            
+            # If too many unfounded terms, mark as uncertain
+            if unfounded_terms > len(key_terms) * 0.3:
+                verdict['confidence'] = min(verdict.get('confidence', 0.5), 0.4)
+                verdict['reasoning'] = f"Analysis based on judge's summary with some interpretation uncertainty."
+        
+        return verdict
+    
+    def _validate_verdict_against_source(self, verdict: Dict[str, Any], judge_summary: str) -> Dict[str, Any]:
+        """Validate verdict components against judge's actual analysis"""
+        
+        # Extract key evidence points
+        key_evidence = self._extract_key_evidence(judge_summary)
+        verdict['key_evidence'] = key_evidence
+        
+        # Rest of the existing validation code...
+        judge_lower = judge_summary.lower()
+        
+        certainty_indicators = {
+            'high': ['clearly', 'definitively', 'conclusively', 'overwhelmingly', 'strongly supports'],
+            'medium': ['likely', 'appears', 'suggests', 'indicates', 'moderately'],
+            'low': ['unclear', 'uncertain', 'mixed', 'inconclusive', 'difficult to determine']
+        }
+        
+        detected_certainty = 'medium'  # default
+        
+        for level, indicators in certainty_indicators.items():
+            if any(indicator in judge_lower for indicator in indicators):
+                detected_certainty = level
+                break
+        
+        # Adjust confidence based on detected certainty
+        if detected_certainty == 'high' and verdict['confidence'] < 0.7:
+            verdict['confidence'] = min(0.8, verdict['confidence'] + 0.2)
+        elif detected_certainty == 'low' and verdict['confidence'] > 0.6:
+            verdict['confidence'] = max(0.4, verdict['confidence'] - 0.2)
+        
+        # Ensure verdict consistency
+        if verdict['verdict'] == 'INSUFFICIENT_EVIDENCE':
+            verdict['confidence'] = min(verdict['confidence'], 0.6)
+        
+        return verdict
+    
+    def _create_evidence_based_fallback(self, judge_summary: str, claim: str) -> Dict[str, Any]:
+        """Create fallback verdict based strictly on judge's text analysis"""
+        
+        if not judge_summary or len(judge_summary.strip()) < 50:
+            return {
+                "verdict": "INSUFFICIENT_EVIDENCE",
+                "confidence": 0.1,
+                "reasoning": "Judge's analysis was too brief or missing for proper evaluation.",
+                "evidence_quality": "WEAK",
+                "winning_side": "tie",
+                "key_evidence": ["No analysis available to extract key evidence points"]
+            }
+        
+        # Extract key evidence even for fallback scoring
+        key_evidence = self._extract_key_evidence(judge_summary)
+        
+        judge_lower = judge_summary.lower()
+        
+        # Rest of the existing fallback code...
+        strong_support_keywords = ['claim is true', 'evidence clearly supports', 'verifier presented compelling']
+        moderate_support_keywords = ['supports the claim', 'evidence suggests', 'likely true']
+        strong_challenge_keywords = ['claim is false', 'evidence contradicts', 'counter-explainer convincingly']
+        moderate_challenge_keywords = ['challenges the claim', 'alternative explanation', 'questionable']
+        uncertainty_keywords = ['insufficient evidence', 'unclear', 'both sides', 'mixed results', 'inconclusive']
+        
+        # Count actual occurrences in judge's text
+        strong_support_count = sum(1 for kw in strong_support_keywords if kw in judge_lower)
+        moderate_support_count = sum(1 for kw in moderate_support_keywords if kw in judge_lower)
+        strong_challenge_count = sum(1 for kw in strong_challenge_keywords if kw in judge_lower)
+        moderate_challenge_count = sum(1 for kw in moderate_challenge_keywords if kw in judge_lower)
+        uncertainty_count = sum(1 for kw in uncertainty_keywords if kw in judge_lower)
+        
+        # Conservative scoring based on actual text content
+        total_support = strong_support_count * 2 + moderate_support_count
+        total_challenge = strong_challenge_count * 2 + moderate_challenge_count
+        
+        if uncertainty_count >= 2 or (total_support == 0 and total_challenge == 0):
+            verdict = "INSUFFICIENT_EVIDENCE"
+            confidence = 0.3 + min(0.3, uncertainty_count * 0.1)
+            winning_side = "tie"
+        elif total_support > total_challenge:
             verdict = "TRUE"
-            confidence = 0.6
-        elif len(opposer_arguments) > len(verifier_arguments):
-            verdict = "FALSE" 
-            confidence = 0.6
+            confidence = 0.5 + min(0.3, (total_support - total_challenge) * 0.1)
+            winning_side = "verifier"
+        elif total_challenge > total_support:
+            verdict = "FALSE"
+            confidence = 0.5 + min(0.3, (total_challenge - total_support) * 0.1)
+            winning_side = "counter_explainer"
         else:
             verdict = "INSUFFICIENT_EVIDENCE"
-            confidence = 0.5
-            
+            confidence = 0.4
+            winning_side = "tie"
+        
         return {
             "verdict": verdict,
-            "confidence": confidence,
-            "reasoning": fallback_reasoning,
-            "key_evidence": ["Evidence analysis incomplete due to technical limitations"],
-            "verifier_score": 5,
-            "opposer_score": 5,
-            "evidence_quality": "MODERATE"
+            "confidence": min(confidence, 0.8),  # Cap confidence for fallback scoring
+            "reasoning": f"Analysis based on judge's summary containing {total_support} supporting and {total_challenge} challenging indicators.",
+            "evidence_quality": "MODERATE" if total_support + total_challenge > 0 else "WEAK",
+            "winning_side": winning_side,
+            "key_evidence": key_evidence  # Add extracted key evidence
         }
+    
+    def _extract_json_verdict(self, response: str) -> Dict[str, Any]:
+        """Extract JSON from response with multiple strategies"""
+        # Strategy 1: Find JSON block
+        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+        
+        # Strategy 2: Look for JSON between markers
+        markers = ['```json', '```', 'JSON:', 'json:']
+        for marker in markers:
+            if marker in response.lower():
+                parts = response.lower().split(marker)
+                if len(parts) > 1:
+                    json_part = parts[1].split('```')[0] if '```' in parts[1] else parts[1]
+                    try:
+                        return json.loads(json_part)
+                    except json.JSONDecodeError:
+                        continue
+        
+        return None
 
-class ClaimVerificationSystem:
-    """Main system orchestrating the debate"""
+    def _extract_key_evidence(self, judge_summary: str) -> List[str]:
+        """Extract key evidence points from judge's summary"""
+        # Split into sentences and look for quoted text and key phrases
+        sentences = judge_summary.split('.')
+        key_evidence = []
+        
+        # Look for sentences with quotes or key indicator phrases
+        evidence_indicators = [
+            'evidence shows', 'according to', 'demonstrates', 'shows that',
+            'proves', 'indicates', 'quoted', 'stated', 'mentioned',
+            'key point', 'important evidence', 'crucial finding',
+            'significant fact', 'notable point'
+        ]
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            # Skip empty or very short sentences
+            if len(sentence) < 10:
+                continue
+                
+            # Check for quoted content
+            if '"' in sentence or '"' in sentence or '"' in sentence:
+                key_evidence.append(sentence)
+                continue
+            
+            # Check for evidence indicator phrases
+            if any(indicator in sentence.lower() for indicator in evidence_indicators):
+                key_evidence.append(sentence)
+                continue
+        
+        # If no key evidence found through quotes or indicators,
+        # look for sentences that mention specific facts or findings
+        if not key_evidence:
+            fact_indicators = ['found', 'discovered', 'revealed', 'showed', 'confirmed']
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if len(sentence) < 10:
+                    continue
+                if any(indicator in sentence.lower() for indicator in fact_indicators):
+                    key_evidence.append(sentence)
+        
+        # If still no key evidence, take the most relevant-looking sentences
+        if not key_evidence:
+            relevant_sentences = [s.strip() for s in sentences if len(s.strip()) > 30 and 
+                                ('evidence' in s.lower() or 'argument' in s.lower())][:3]
+            key_evidence.extend(relevant_sentences)
+        
+        # Clean up the evidence points
+        cleaned_evidence = []
+        for evidence in key_evidence:
+            # Remove common prefixes that might have been picked up
+            evidence = re.sub(r'^(In addition,|Moreover,|Furthermore,|Additionally,)\s*', '', evidence)
+            # Clean up any extra whitespace
+            evidence = ' '.join(evidence.split())
+            cleaned_evidence.append(evidence)
+        
+        # Limit to top 5 most relevant points and ensure they're unique
+        unique_evidence = list(dict.fromkeys(cleaned_evidence))[:5]
+        
+        # If we somehow have no evidence points, add a fallback
+        if not unique_evidence:
+            unique_evidence = ["No specific key evidence points were identified in the judge's analysis"]
+        
+        return unique_evidence
+
+class LangGraphClaimVerificationSystem:
+    """LangGraph-based claim verification system"""
     
     def __init__(self):
         self.client = LMStudioClient()
         self.scraper = WebScraper()
-        self.verifier = VerifierAgent(AgentRole.VERIFIER, PHI_MODEL, self.client)
-        self.opposer = OpposerAgent(AgentRole.OPPOSER, PHI_MODEL, self.client)
-        self.judge = JudgeAgent(AgentRole.JUDGE, GEMMA_MODEL, self.client)
+        # Add memory saver for state persistence
+        self.memory = MemorySaver()
+        self.graph = self._build_graph()
     
-    def run_verification(self, claim: str, urls: List[str], num_rounds: int = 2) -> Dict[str, Any]:
-        """Run the complete verification process"""
+    def validate_state(self, state: GraphState) -> bool:
+        """Validate state transitions"""
+        required_fields = ["claim", "urls", "current_round", "max_rounds"]
+        return all(field in state for field in required_fields)
+    
+    def route_after_scraping(self, state: GraphState) -> Literal["success", "retry", "error"]:
+        """Enhanced routing after scraping"""
+        if state.get("error_message"):
+            retry_count = state.get("retry_count", 0)
+            if retry_count < 3:
+                return "retry"
+            else:
+                return "error"
         
-        # Initialize state
-        state = DebateState(
-            claim=claim,
-            urls=urls,
-            scraped_content=[],
-            verifier_arguments=[],
-            opposer_arguments=[],
-            debate_rounds=num_rounds,
-            current_round=0,
-            final_judgment=None,
-            debate_history=[]
-        )
+        successful_scrapes = [item for item in state.get("scraped_content", []) if item.get('status') == 'success']
+        if successful_scrapes:
+            return "success"
+        else:
+            return "retry" if state.get("retry_count", 0) < 3 else "error"
+
+    def route_after_agent(self, state: GraphState) -> Literal["success", "retry", "error"]:
+        """Enhanced routing after agent execution"""
+        if state.get("error_message"):
+            retry_count = state.get("retry_count", 0)
+            return "retry" if retry_count < 3 else "error"
+        return "success"
+
+    def should_continue_debate(self, state: GraphState) -> Literal["continue", "end", "error"]:
+        """Enhanced debate continuation logic"""
+        if state.get("error_message"):
+            return "error"
+        
+        current_round = state.get("current_round", 1)
+        max_rounds = state.get("max_rounds", 2)
+        
+        # Ensure we have arguments from both sides
+        verifier_args = len(state.get("verifier_arguments", []))
+        opposer_args = len(state.get("opposer_arguments", []))
+        
+        if current_round > max_rounds:
+            return "end"
+        elif verifier_args == 0 or opposer_args == 0:
+            return "continue"  # Need at least one argument from each side
+        else:
+            return "continue" if current_round <= max_rounds else "end"
+
+    def route_retry(self, state: GraphState) -> Literal["scrape", "verifier", "counter_explainer", "error"]:
+        """Route retry attempts to the appropriate node"""
+        last_error_node = state.get("last_error_node")
+        
+        if last_error_node == "scrape_evidence":
+            return "scrape"
+        elif last_error_node == "verifier_turn":
+            return "verifier"
+        elif last_error_node == "counter_explainer_turn":
+            return "counter_explainer"
+        else:
+            return "error"
+
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow with enhanced error handling and retries"""
+        try:
+            workflow = StateGraph(GraphState)
+            
+            # Add nodes including retry handler
+            workflow.add_node("scrape_evidence", self.scrape_evidence_node)
+            workflow.add_node("verifier_turn", self.verifier_node)
+            workflow.add_node("counter_explainer_turn", self.counter_explainer_node)
+            workflow.add_node("judge_decision", self.judge_node)
+            workflow.add_node("check_rounds", self.check_rounds_node)
+            workflow.add_node("error_handler", self.error_handler_node)
+            workflow.add_node("retry_handler", self.retry_handler_node)
+            
+            # Define edges with retry logic
+            workflow.add_edge(START, "scrape_evidence")
+            
+            workflow.add_conditional_edges(
+                "scrape_evidence",
+                self.route_after_scraping,
+                {
+                    "success": "verifier_turn",
+                    "retry": "retry_handler",
+                    "error": "error_handler"
+                }
+            )
+            
+            workflow.add_conditional_edges(
+                "verifier_turn",
+                self.route_after_agent,
+                {
+                    "success": "counter_explainer_turn",
+                    "retry": "retry_handler", 
+                    "error": "error_handler"
+                }
+            )
+            
+            workflow.add_conditional_edges(
+                "counter_explainer_turn",
+                self.route_after_agent,
+                {
+                    "success": "check_rounds",
+                    "retry": "retry_handler",
+                    "error": "error_handler"
+                }
+            )
+            
+            workflow.add_conditional_edges(
+                "check_rounds",
+                self.should_continue_debate,
+                {
+                    "continue": "verifier_turn",
+                    "end": "judge_decision",
+                    "error": "error_handler"
+                }
+            )
+            
+            workflow.add_conditional_edges(
+                "retry_handler",
+                self.route_retry,
+                {
+                    "scrape": "scrape_evidence",
+                    "verifier": "verifier_turn", 
+                    "counter_explainer": "counter_explainer_turn",
+                    "error": "error_handler"
+                }
+            )
+            
+            workflow.add_edge("judge_decision", END)
+            workflow.add_edge("error_handler", END)
+            
+            return workflow.compile(checkpointer=self.memory)
+            
+        except Exception as e:
+            st.error(f"Failed to build LangGraph: {str(e)}")
+            raise e
+    
+    def validate_state_node(self, state: GraphState) -> GraphState:
+        """Node: Validate initial state"""
+        if not self.validate_state(state):
+            new_state = dict(state)
+            new_state["error_message"] = "Invalid state: missing required fields"
+            return new_state
+        return state
+    
+    def check_state_valid(self, state: GraphState) -> Literal["valid", "invalid"]:
+        """Check if state is valid"""
+        return "valid" if not state.get("error_message") else "invalid"
+    
+    def scrape_evidence_node(self, state: GraphState) -> GraphState:
+        """Node: Scrape evidence from URLs"""
+        st.write("## 🔍 Scraping Evidence")
         
         try:
-            # Step 1: Scrape URLs
-            st.write("## 🔍 Scraping Evidence")
-            state.scraped_content = self.scraper.scrape_urls(urls)
-            
-            successful_scrapes = [item for item in state.scraped_content if item['status'] == 'success']
-            st.write(f"✅ Successfully scraped {len(successful_scrapes)} out of {len(urls)} URLs")
-            
-            # Step 2: Run debate rounds
-            st.write("## 🎭 AI Agents Debate")
-            
-            for round_num in range(1, num_rounds + 1):
-                st.write(f"### Round {round_num}")
-                state.current_round = round_num
-                
-                # Verifier's turn
-                try:
-                    with st.spinner("🟢 Verifier Agent thinking..."):
-                        verifier_arg = self.verifier.generate_argument(
-                            claim, state.scraped_content, state.opposer_arguments, round_num
-                        )
-                        state.verifier_arguments.append(verifier_arg)
-                    
-                    st.write("**🟢 Verifier (Supporting the claim):**")
-                    st.write(verifier_arg)
-                except Exception as e:
-                    st.error(f"Verifier error: {str(e)}")
-                    state.verifier_arguments.append("Unable to generate argument due to technical issues.")
-                
-                # Opposer's turn
-                try:
-                    with st.spinner("🔴 Opposer Agent thinking..."):
-                        opposer_arg = self.opposer.generate_argument(
-                            claim, state.scraped_content, state.verifier_arguments, round_num
-                        )
-                        state.opposer_arguments.append(opposer_arg)
-                    
-                    st.write("**🔴 Opposer (Challenging the claim):**")
-                    st.write(opposer_arg)
-                except Exception as e:
-                    st.error(f"Opposer error: {str(e)}")
-                    state.opposer_arguments.append("Unable to generate argument due to technical issues.")
-                
-                # Record round
-                state.debate_history.append({
-                    'round': round_num,
-                    'verifier_argument': state.verifier_arguments[-1] if state.verifier_arguments else "No argument generated",
-                    'opposer_argument': state.opposer_arguments[-1] if state.opposer_arguments else "No argument generated"
-                })
-                
-                st.write("---")
-            
-            # Step 3: Judge's final decision
-            st.write("## ⚖️ Final Judgment")
-            try:
-                with st.spinner("🧑‍⚖️ Judge Agent deliberating..."):
-                    judgment = self.judge.make_judgment(
-                        claim, state.scraped_content, 
-                        state.verifier_arguments, state.opposer_arguments
-                    )
-                    state.final_judgment = judgment
-            except Exception as e:
-                st.error(f"Judge error: {str(e)}")
-                # Provide a fallback judgment
-                judgment = {
-                    "verdict": "INSUFFICIENT_EVIDENCE",
-                    "confidence": 0.5,
-                    "reasoning": f"Technical error prevented proper judgment: {str(e)}",
-                    "key_evidence": ["Analysis incomplete due to technical issues"],
-                    "verifier_score": 5,
-                    "opposer_score": 5,
-                    "evidence_quality": "MODERATE"
-                }
-                state.final_judgment = judgment
+            scraped_content = self.scraper.scrape_urls(state["urls"])
+            successful_scrapes = [item for item in scraped_content if item['status'] == 'success']
+            st.write(f"✅ Successfully scraped {len(successful_scrapes)} out of {len(state['urls'])} URLs")
             
             return {
-                'state': state,
-                'judgment': judgment,
-                'scraped_content': state.scraped_content,
-                'debate_history': state.debate_history
+                **state,
+                "scraped_content": scraped_content,
+                "messages": state["messages"] + [HumanMessage(content=f"Scraped {len(successful_scrapes)} sources successfully")],
+                "error_message": None,
+                "retry_count": 0
             }
             
         except Exception as e:
-            st.error(f"System error: {str(e)}")
-            # Return minimal fallback results
+            st.error(f"Scraping failed: {str(e)}")
             return {
-                'state': state,
+                **state,
+                "error_message": f"Scraping failed: {str(e)}",
+                "scraped_content": [],
+                "messages": state["messages"] + [HumanMessage(content=f"Scraping failed: {str(e)}")],
+                "retry_count": state.get("retry_count", 0) + 1,
+                "last_error_node": "scrape_evidence"
+            }
+    
+    def verifier_node(self, state: GraphState) -> GraphState:
+        """Node: Generate verifier argument"""
+        round_num = state["current_round"]
+        st.write(f"### Round {round_num}")
+        
+        try:
+            with st.spinner("🟢 Verifier Agent thinking..."):
+                verifier = VerifierAgent(AgentRole.VERIFIER, QWEN_MODEL, self.client)
+                argument = verifier.generate_argument(
+                    state["claim"], 
+                    state["scraped_content"], 
+                    state["opposer_arguments"], 
+                    round_num
+                )
+            
+            st.write("**🟢 Verifier (Supporting the claim):**")
+            st.write(argument)
+            
+            return {
+                **state,
+                "verifier_arguments": state["verifier_arguments"] + [argument],
+                "messages": state["messages"] + [AIMessage(content=f"Verifier Round {round_num}: {argument}")],
+                "error_message": None,
+                "retry_count": 0
+            }
+            
+        except Exception as e:
+            st.error(f"Verifier error: {str(e)}")
+            return {
+                **state,
+                "error_message": f"Verifier error: {str(e)}",
+                "verifier_arguments": state["verifier_arguments"] + [f"Error in round {round_num}: Unable to generate argument"],
+                "retry_count": state.get("retry_count", 0) + 1,
+                "last_error_node": "verifier_turn"
+            }
+    
+    def counter_explainer_node(self, state: GraphState) -> GraphState:
+        """Node: Generate counter-explainer analysis"""
+        round_num = state["current_round"]
+        
+        try:
+            with st.spinner("🔄 Counter-Explainer Agent analyzing..."):
+                counter_explainer = CounterExplainerAgent(AgentRole.COUNTER_EXPLAINER, QWEN_MODEL, self.client)
+                argument = counter_explainer.generate_argument(
+                    state["claim"], 
+                    state["scraped_content"], 
+                    state["verifier_arguments"], 
+                    round_num
+                )
+            
+            st.write("**🔄 Counter-Explainer (Providing alternative perspectives):**")
+            st.write(argument)
+            
+            return {
+                **state,
+                "opposer_arguments": state["opposer_arguments"] + [argument],
+                "messages": state["messages"] + [AIMessage(content=f"Counter-Explainer Round {round_num}: {argument}")],
+                "error_message": None,
+                "retry_count": 0
+            }
+            
+        except Exception as e:
+            st.error(f"Counter-Explainer error: {str(e)}")
+            return {
+                **state,
+                "error_message": f"Counter-Explainer error: {str(e)}",
+                "opposer_arguments": state["opposer_arguments"] + [f"Error in round {round_num}: Unable to generate analysis"],
+                "retry_count": state.get("retry_count", 0) + 1,
+                "last_error_node": "counter_explainer_turn"
+            }
+    
+    def check_rounds_node(self, state: GraphState) -> GraphState:
+        """Node: Check if we should continue the debate"""
+        return {
+            **state,
+            "current_round": state["current_round"] + 1,
+            "round_complete": True,
+            "error_message": None
+        }
+    
+    def judge_node(self, state: GraphState) -> GraphState:
+        """Node: Generate natural language summary and structured verdict"""
+        st.write("## ⚖️ Final Judgment")
+        
+        try:
+            with st.spinner("🧑‍⚖️ Judge Agent analyzing debate..."):
+                judge = JudgeAgent(AgentRole.JUDGE, PHI_MODEL, self.client)
+                judge_summary = judge.make_judgment(
+                    state["claim"], 
+                    state["scraped_content"], 
+                    state["verifier_arguments"], 
+                    state["opposer_arguments"]
+                )
+            
+            st.write("### 📝 Judge's Analysis")
+            st.write(judge_summary)
+            
+            with st.spinner("📊 Scoring the debate..."):
+                scoring_agent = ScoringAgent(self.client, PHI_MODEL)
+                structured_verdict = scoring_agent.score_debate(judge_summary, state["claim"])
+            
+            # Combine judge summary with structured verdict
+            final_judgment = {
+                **structured_verdict,
+                "judge_summary": judge_summary
+            }
+            
+            return {
+                **state,
+                "final_judgment": final_judgment,
+                "debate_complete": True,
+                "messages": state["messages"] + [AIMessage(content=f"Final judgment: {structured_verdict['verdict']} with {structured_verdict['confidence']:.2f} confidence")],
+                "error_message": None
+            }
+            
+        except Exception as e:
+            st.error(f"Judge/Scoring error: {str(e)}")
+            fallback_judgment = {
+                "verdict": "INSUFFICIENT_EVIDENCE",
+                "confidence": 0.5,
+                "reasoning": f"Technical error prevented proper judgment: {str(e)}",
+                "evidence_quality": "MODERATE",
+                "winning_side": "tie",
+                "judge_summary": f"Analysis incomplete due to technical error: {str(e)}"
+            }
+            
+            return {
+                **state,
+                "final_judgment": fallback_judgment,
+                "debate_complete": True,
+                "error_message": f"Judge error: {str(e)}",
+                "messages": state["messages"] + [AIMessage(content="Final judgment completed with errors")]
+            }
+    
+    def check_scraping_success(self, state: GraphState) -> Literal["success", "error"]:
+        """Check if scraping was successful"""
+        if state.get("error_message"):
+            return "error"
+        successful_scrapes = [item for item in state.get("scraped_content", []) if item.get('status') == 'success']
+        return "success" if successful_scrapes else "error"
+    
+    def check_agent_success(self, state: GraphState) -> Literal["success", "error"]:  
+        """Check if agent execution was successful"""
+        return "error" if state.get("error_message") else "success"
+    
+    def error_handler_node(self, state: GraphState) -> GraphState:
+        """Node: Handle errors gracefully"""
+        error_msg = state.get("error_message", "Unknown error occurred")
+        st.error(f"System Error: {error_msg}")
+        
+        # Create fallback judgment with updated structure
+        fallback_judgment = {
+            "verdict": "INSUFFICIENT_EVIDENCE",
+            "confidence": 0.0,
+            "reasoning": f"Analysis failed due to system error: {error_msg}",
+            "evidence_quality": "WEAK",
+            "winning_side": "tie",
+            "judge_summary": f"Analysis failed due to system error: {error_msg}"
+        }
+        
+        return {
+            "final_judgment": fallback_judgment,
+            "debate_complete": True,
+            "messages": [AIMessage(content=f"Process terminated due to error: {error_msg}")]
+        }
+    
+    def retry_handler_node(self, state: GraphState) -> GraphState:
+        """Node: Handle retries with exponential backoff"""
+        retry_count = state.get("retry_count", 0)
+        max_retries = 3
+        
+        if retry_count >= max_retries:
+            return {
+                **state,
+                "error_message": f"Max retries ({max_retries}) exceeded for node: {state.get('last_error_node', 'unknown')}",
+                "debate_complete": True
+            }
+        
+        # Exponential backoff
+        sleep_time = 2 ** retry_count
+        st.info(f"Retrying in {sleep_time} seconds... (Attempt {retry_count + 1}/{max_retries})")
+        time.sleep(sleep_time)
+        
+        return state
+    
+    def run_verification(self, claim: str, urls: List[str], num_rounds: int = 2) -> Dict[str, Any]:
+        """Run the complete verification process using LangGraph"""
+        
+        # Check dependencies first
+        if not check_dependencies():
+            return {
+                'success': False,
+                'error': 'Missing required dependencies'
+            }
+        
+        # Initialize the state
+        initial_state: GraphState = {
+            "claim": claim,
+            "urls": urls,
+            "scraped_content": [],
+            "verifier_arguments": [],
+            "opposer_arguments": [],
+            "current_round": 1,
+            "max_rounds": num_rounds,
+            "final_judgment": None,
+            "messages": [HumanMessage(content=f"Starting verification for claim: {claim}")],
+            "next_action": "scrape",
+            "round_complete": False,
+            "error_message": None,
+            "debate_complete": False,
+            "retry_count": 0,
+            "last_error_node": None
+        }
+        
+        try:
+            st.write("🚀 **Starting LangGraph Execution**")
+            
+            # Create a unique thread ID for this verification session
+            thread_id = f"verification_{int(time.time())}"
+            config = RunnableConfig(configurable={"thread_id": thread_id})
+            
+            # Execute the graph with proper config
+            final_state = self.graph.invoke(initial_state, config=config)
+            
+            st.success("✅ LangGraph execution completed successfully")
+            
+            return {
+                'state': final_state,
+                'judgment': final_state.get('final_judgment', {}),
+                'scraped_content': final_state.get('scraped_content', []),
+                'debate_history': self._extract_debate_history(final_state),
+                'messages': final_state.get('messages', []),
+                'success': True,
+                'error': final_state.get('error_message')
+            }
+            
+        except Exception as e:
+            error_msg = f"LangGraph execution error: {str(e)}"
+            st.error(error_msg)
+            logger.error(error_msg)
+            
+            return {
+                'state': initial_state,
                 'judgment': {
                     "verdict": "INSUFFICIENT_EVIDENCE",
                     "confidence": 0.0,
-                    "reasoning": f"System encountered critical error: {str(e)}",
+                    "reasoning": error_msg,
                     "key_evidence": ["Analysis failed due to system error"],
                     "verifier_score": 0,
                     "opposer_score": 0,
                     "evidence_quality": "WEAK"
                 },
-                'scraped_content': state.scraped_content,
-                'debate_history': state.debate_history
+                'scraped_content': [],
+                'debate_history': [],
+                'messages': [HumanMessage(content=error_msg)],
+                'success': False,
+                'error': error_msg
             }
+    
+    def _extract_debate_history(self, final_state: GraphState) -> List[Dict[str, Any]]:
+        """Extract debate history from the final state"""
+        history = []
+        verifier_args = final_state.get('verifier_arguments', [])
+        opposer_args = final_state.get('opposer_arguments', [])
+        
+        max_rounds = min(len(verifier_args), len(opposer_args))
+        
+        for i in range(max_rounds):
+            history.append({
+                'round': i + 1,
+                'verifier_argument': verifier_args[i] if i < len(verifier_args) else "No argument generated",
+                'opposer_argument': opposer_args[i] if i < len(opposer_args) else "No argument generated"
+            })
+        
+        return history
 
 # Streamlit UI
 def main():
     st.set_page_config(
         page_title="AI Claim Verification System",
-        page_icon="🔍",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        page_icon="⚖️",
+        layout="wide"
     )
     
-    st.title("🔍 AI Claim Verification System")
-    st.markdown("""
-    **An AI-powered system that verifies claims through intelligent debate**
-    
-    This system uses multiple AI agents to analyze claims:
-    - 🟢 **Verifier Agent**: Argues for the claim's truth
-    - 🔴 **Opposer Agent**: Challenges the claim  
-    - ⚖️ **Judge Agent**: Makes the final verdict
+    st.title("⚖️ AI Claim Verification System")
+    st.write("""
+    This system uses AI agents to verify claims by searching for evidence online and conducting a structured debate.
+    The agents will analyze the evidence, present arguments for and against the claim, and make a final judgment.
     """)
     
-    # Sidebar configuration
-    with st.sidebar:
-        st.header("⚙️ Configuration")
-        
-        # Check LM Studio connection
-        st.subheader("LM Studio Connection")
-        try:
-            client = LMStudioClient()
-            test_response = client.client.models.list()
-            st.success("✅ Connected to LM Studio")
-            
-            models = [model.id for model in test_response.data]
-            st.write("Available models:", models)
-            
-            if PHI_MODEL not in models:
-                st.warning(f"⚠️ {PHI_MODEL} not found. Please load it in LM Studio.")
-            if GEMMA_MODEL not in models:
-                st.warning(f"⚠️ {GEMMA_MODEL} not found. Please load it in LM Studio.")
-                
-        except Exception as e:
-            st.error(f"❌ Cannot connect to LM Studio: {str(e)}")
-            st.info("Please ensure LM Studio is running on http://localhost:1234")
-        
-        # Debate configuration
-        st.subheader("Debate Settings")
-        num_rounds = st.slider("Number of debate rounds", 1, 5, 2)
-        
-    # Main interface
-    col1, col2 = st.columns([2, 1])
+    # Input section
+    st.write("## 📝 Input")
+    claim = st.text_area("Enter the claim to verify:", height=100)
     
-    with col1:
-        st.header("1. Enter Your Claim")
-        claim = st.text_area(
-            "What claim would you like to verify?",
-            placeholder="e.g., Climate change is primarily caused by human activities",
-            height=100
-        )
-        
-        st.header("2. Add Evidence URLs")
-        urls = []
-        
-        # URL input system
-        if 'url_count' not in st.session_state:
-            st.session_state.url_count = 1
-        
-        for i in range(st.session_state.url_count):
-            url = st.text_input(f"URL {i+1}:", key=f"url_{i}")
-            if url:
-                urls.append(url)
-        
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("➕ Add Another URL"):
-                st.session_state.url_count += 1
-                st.rerun()
-        
-        with col_b:
-            if st.button("➖ Remove Last URL") and st.session_state.url_count > 1:
-                st.session_state.url_count -= 1
-                st.rerun()
-        
-        # Start verification
-        if st.button("🚀 Start Verification", type="primary", disabled=not (claim and urls)):
-            if claim and urls:
-                with st.spinner("Initializing AI agents..."):
-                    system = ClaimVerificationSystem()
-                    
-                start_time = time.time()
-                results = system.run_verification(claim, urls, num_rounds)
-                end_time = time.time()
+    # URL input
+    urls_text = st.text_area(
+        "Enter URLs with relevant evidence (one per line):",
+        height=150,
+        help="Enter each URL on a new line. The system will scrape these pages for evidence."
+    )
+    
+    urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
+    
+    # Number of debate rounds
+    num_rounds = st.slider("Number of debate rounds:", min_value=1, max_value=5, value=2)
+    
+    # Verification button
+    if st.button("🚀 Start Verification", type="primary", disabled=not (claim and urls)):
+        if claim and urls:
+            with st.spinner("Initializing LangGraph AI system..."):
+                system = LangGraphClaimVerificationSystem()
                 
-                # Display results - with safe access to judgment
-                st.success(f"✅ Verification completed in {end_time - start_time:.1f} seconds")
+            start_time = time.time()
+            results = system.run_verification(claim, urls, num_rounds)
+            end_time = time.time()
+            
+            st.success(f"✅ LangGraph verification completed in {end_time - start_time:.1f} seconds")
+            
+            # Display judgment
+            judgment = results['judgment']
+            if judgment:
+                st.write("## 📊 Final Results")
                 
-                judgment = results.get('judgment', {})
-                
-                # Safe access to judgment fields with defaults
-                verdict = judgment.get('verdict', 'INSUFFICIENT_EVIDENCE')
-                confidence = judgment.get('confidence', 0.0)
-                reasoning = judgment.get('reasoning', 'No reasoning provided')
-                verifier_score = judgment.get('verifier_score', 0)
-                opposer_score = judgment.get('opposer_score', 0)
-                key_evidence = judgment.get('key_evidence', [])
-                
-                # Verdict display
-                verdict_color = {
-                    'TRUE': '🟢',
-                    'FALSE': '🔴', 
-                    'INSUFFICIENT_EVIDENCE': '🟡'
-                }
-                
-                st.header(f"## Final Verdict: {verdict_color.get(verdict, '❓')} {verdict}")
-                
+                # Create columns for the verdict display
                 col1, col2, col3 = st.columns(3)
+                
                 with col1:
-                    st.metric("Confidence", f"{confidence:.2f}")
+                    st.metric("Verdict", judgment['verdict'])
                 with col2:
-                    st.metric("Verifier Score", f"{verifier_score}/10")
+                    st.metric("Confidence", f"{judgment['confidence']:.2%}")
                 with col3:
-                    st.metric("Opposer Score", f"{opposer_score}/10")
+                    st.metric("Evidence Quality", judgment['evidence_quality'])
                 
-                st.write("**Reasoning:**")
-                st.write(reasoning)
+                st.write("### 📝 Reasoning")
+                st.write(judgment['reasoning'])
                 
-                if key_evidence:
-                    st.write("**Key Evidence:**")
-                    for evidence in key_evidence:
-                        st.write(f"• {evidence}")
-                
-                # Detailed results in expander
-                with st.expander("📊 Detailed Results"):
-                    tab1, tab2, tab3 = st.tabs(["🔍 Scraped Content", "🎭 Debate History", "📈 Analysis"])
-                    
-                    with tab1:
-                        scraped_content = results.get('scraped_content', [])
-                        for i, content in enumerate(scraped_content):
-                            st.subheader(f"Source {i+1}: {content.get('title', 'No title')}")
-                            st.write(f"**URL:** {content.get('url', 'No URL')}")
-                            st.write(f"**Status:** {content.get('status', 'Unknown')}")
-                            if content.get('status') == 'success':
-                                st.write(f"**Content Preview:**")
-                                content_text = content.get('content', '')
-                                st.write(content_text[:500] + "..." if len(content_text) > 500 else content_text)
-                            else:
-                                st.error(f"Error: {content.get('error', 'Unknown error')}")
-                            st.write("---")
-                    
-                    with tab2:
-                        debate_history = results.get('debate_history', [])
-                        for round_data in debate_history:
-                            st.subheader(f"Round {round_data.get('round', '?')}")
-                            st.write("**🟢 Verifier:**")
-                            st.write(round_data.get('verifier_argument', 'No argument generated'))
-                            st.write("**🔴 Opposer:**")
-                            st.write(round_data.get('opposer_argument', 'No argument generated'))
-                            st.write("---")
-                    
-                    with tab3:
-                        # Create summary dataframe
-                        evidence_quality = judgment.get('evidence_quality', 'N/A')
-                        summary_data = {
-                            'Metric': ['Evidence Quality', 'Confidence', 'Verifier Performance', 'Opposer Performance'],
-                            'Value': [
-                                evidence_quality,
-                                f"{confidence:.2f}",
-                                f"{verifier_score}/10",
-                                f"{opposer_score}/10"
-                            ]
-                        }
-                        st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
-                        
-                        # URLs success rate
-                        scraped_content = results.get('scraped_content', [])
-                        successful_scrapes = len([item for item in scraped_content if item.get('status') == 'success'])
-                        total_urls = len(scraped_content)
-                        if total_urls > 0:
-                            success_rate = successful_scrapes/total_urls*100
-                            st.metric("Scraping Success Rate", f"{successful_scrapes}/{total_urls} ({success_rate:.1f}%)")
-                        else:
-                            st.metric("Scraping Success Rate", "0/0 (0%)")
-    
-    with col2:
-        st.header("📋 Instructions")
-        st.markdown("""
-        ### How it works:
-        
-        1. **Enter a claim** you want to verify
-        
-        2. **Add URLs** containing relevant evidence
-        
-        3. **AI agents debate**:
-           - Verifier argues the claim is true
-           - Opposer challenges the claim
-           - Judge makes final verdict
-        
-        4. **Get results** with confidence scores and reasoning
-        
-        ### Tips:
-        - Use reputable news sources
-        - Include diverse perspectives  
-        - More evidence = better analysis
-        - Be specific with claims
-        """)
-        
-        st.header("🔧 System Status")
-        
-        # System health checks
-        try:
-            client = LMStudioClient()
-            st.success("✅ LM Studio Connected")
-        except Exception as e:
-            st.error("❌ LM Studio Disconnected")
-        
-        st.info("💡 Make sure LM Studio is running with the required models loaded")
+                st.write("### 🔑 Key Evidence")
+                for evidence in judgment['key_evidence']:
+                    st.write(f"- {evidence}")
+
+            
+            
+            # Display scraped sources
+            st.write("## 📚 Sources")
+            for source in results['scraped_content']:
+                with st.expander(f"Source: {source['url']}"):
+                    st.write(f"**Title:** {source['title']}")
+                    st.write(f"**Status:** {source['status']}")
+                    if source['status'] == 'success':
+                        st.write("**Content Preview:**")
+                        st.write(source['content'][:500] + "...")
+                    else:
+                        st.error(f"Error: {source.get('error', 'Unknown error')}")
+        else:
+            st.warning("Please enter a claim and at least one URL to verify.")
 
 if __name__ == "__main__":
     main()
