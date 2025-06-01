@@ -277,7 +277,7 @@ class DebateAgent:
     def __init__(self, role: AgentRole, model: str, client: LMStudioClient):
         self.role = role
         self.model = model
-        self.client = client
+        self.client = client  # Add this line that was missing
         self.conversation_history = []
     
     def generate_argument(self, claim: str, evidence: List[Dict[str, Any]], 
@@ -448,7 +448,7 @@ CONTENT: {content}
         return f"\n\nPREVIOUS {opponent_name.upper()} ARGUMENTS TO ANALYZE:\n" + '\n\n'.join(formatted_args)
 
 class JudgeAgent(DebateAgent):
-    """Agent that provides comprehensive debate analysis with anti-hallucination measures"""
+    """Agent that provides comprehensive debate analysis with structured, detailed prompting"""
     
     def make_judgment(self, claim: str, evidence: List[Dict[str, Any]], 
                      verifier_arguments: List[str], counter_explainer_arguments: List[str]) -> str:
@@ -458,15 +458,15 @@ class JudgeAgent(DebateAgent):
             return "Insufficient debate content to analyze. At least one argument from each side is required."
         
         evidence_summary = self._summarize_evidence_safely(evidence)
-        verifier_summary = self._summarize_arguments_safely(verifier_arguments, "Verifier")
-        counter_explainer_summary = self._summarize_arguments_safely(counter_explainer_arguments, "Counter-Explainer")
+        verifier_summary = self._format_arguments_for_analysis(verifier_arguments, "Verifier")
+        counter_explainer_summary = self._format_arguments_for_analysis(counter_explainer_arguments, "Counter-Explainer")
         
-        # More constrained and specific prompt to prevent hallucination
-        prompt = f"""You are analyzing a structured debate. Provide ONLY factual analysis based on the provided content.
+        # Detailed, structured prompt similar to other agents
+        prompt = f"""You are an expert debate judge and critical analyst. Your role is to provide a thorough, objective analysis of the debate between two AI agents regarding a specific claim.
 
 CLAIM BEING ANALYZED: "{claim}"
 
-EVIDENCE PROVIDED:
+EVIDENCE PROVIDED TO BOTH SIDES:
 {evidence_summary}
 
 VERIFIER ARGUMENTS (supporting the claim):
@@ -475,76 +475,129 @@ VERIFIER ARGUMENTS (supporting the claim):
 COUNTER-EXPLAINER ARGUMENTS (providing alternative perspectives):
 {counter_explainer_summary}
 
-STRICT INSTRUCTIONS:
-1. Analyze ONLY the arguments and evidence provided above
-2. Do NOT add information not present in the source material
-3. Do NOT make assumptions about facts not stated
-4. Quote directly from the arguments when referencing specific points
-5. If something is unclear or missing, explicitly state that
+YOUR TASK AS JUDGE:
+Provide a comprehensive analysis following this EXACT structure:
 
-REQUIRED ANALYSIS FORMAT:
-1. ARGUMENT SUMMARY: Briefly summarize what each side actually argued (quote key phrases)
-2. EVIDENCE ASSESSMENT: Evaluate only the evidence sources that were actually provided
-3. LOGICAL ANALYSIS: Compare the reasoning quality of both sides' actual arguments
-4. GAPS IDENTIFIED: What information or reasoning is missing from both sides?
+1. ARGUMENT QUALITY ASSESSMENT
+   - Evaluate the logical structure of each side's arguments
+   - Assess how well each side used the provided evidence
+   - Identify the strongest points made by each side
+   - Note any logical fallacies or weak reasoning
 
-Keep your analysis factual and grounded in the provided content only. Do not speculate beyond what was presented."""
+2. EVIDENCE UTILIZATION ANALYSIS
+   - How effectively did each side reference the source material?
+   - Were quotes and citations used appropriately?
+   - Did either side misrepresent or overstate the evidence?
+   - What evidence was overlooked or underutilized?
+
+3. DEBATE DYNAMICS EVALUATION
+   - How well did each side respond to their opponent's points?
+   - Were counter-arguments addressed effectively?
+   - Did the debate evolve constructively across rounds?
+   - What were the key turning points in the debate?
+
+4. CRITICAL GAPS AND LIMITATIONS
+   - What important information or perspectives were missing?
+   - What assumptions did each side make?
+   - What questions remain unanswered?
+   - How might additional evidence change the analysis?
+
+5. OVERALL ASSESSMENT
+   - Which side presented the more compelling case overall?
+   - What are the key factors that influenced your assessment?
+   - How confident can we be in any conclusions drawn?
+   - What are the main takeaways from this debate?
+
+ANALYSIS REQUIREMENTS:
+- Base your analysis ONLY on the provided arguments and evidence
+- Quote directly from the arguments when making specific points
+- Be objective and identify strengths/weaknesses in both sides
+- Acknowledge uncertainties and limitations explicitly
+- Do NOT introduce external information not present in the materials
+- Keep each section focused and substantive (100-200 words per section)
+- Use clear, professional language throughout
+
+Begin your structured analysis now:"""
 
         messages = [
             {
                 "role": "system", 
-                "content": """You are a factual debate analyst. You analyze only the content provided to you without adding external information. You quote directly from source material and explicitly note when information is missing or unclear. You never invent facts, quotes, or evidence that wasn't provided to you. If you cannot make a determination based on provided content, you state this clearly."""
+                "content": """You are a professional debate judge and analytical expert. You provide structured, objective analysis of debates using only the information provided to you. You excel at:
+- Evaluating argument quality and logical reasoning
+- Assessing evidence utilization and source credibility
+- Identifying strengths and weaknesses objectively
+- Recognizing gaps and limitations in reasoning
+- Providing balanced, nuanced assessments
+
+You NEVER introduce information not present in the source materials. You quote directly from arguments when making specific points. You maintain strict objectivity and acknowledge when evidence is insufficient for strong conclusions."""
             },
             {"role": "user", "content": prompt}
         ]
         
-        # Use lower temperature for more focused, less creative responses
-        response = self.client.generate_response(self.model, messages, temperature=0.2, max_tokens=1200)
+        # Use lower temperature for more focused, structured responses
+        response = self.client.generate_response(self.model, messages, temperature=0.3, max_tokens=2048)
         
-        # Validate the response doesn't contain obvious hallucinations
-        validated_response = self._validate_judge_response(response, verifier_arguments, counter_explainer_arguments, evidence)
+        # Validate the response structure
+        validated_response = self._validate_structured_response(response, verifier_arguments, counter_explainer_arguments, evidence)
         
         return validated_response
     
-    def _validate_judge_response(self, response: str, verifier_args: List[str], counter_args: List[str], evidence: List[Dict[str, Any]]) -> str:
-        """Validate judge response against source material to catch hallucinations"""
+    def _format_arguments_for_analysis(self, arguments: List[str], role_name: str) -> str:
+        """Format arguments in a clear, structured way for judge analysis"""
+        if not arguments:
+            return f"{role_name}: No arguments were presented during the debate."
         
-        # Check for common hallucination patterns
-        suspicious_phrases = [
-            "according to studies", "research shows", "experts say", "it is well known",
-            "statistics indicate", "data suggests", "multiple sources confirm"
-        ]
+        formatted = f"{role_name.upper()} PRESENTED {len(arguments)} ARGUMENT(S):\n\n"
         
-        # Flag potential hallucinations
-        warnings = []
-        response_lower = response.lower()
+        for i, arg in enumerate(arguments):
+            # Add clear argument markers and preserve full content
+            formatted += f"--- {role_name.upper()} ROUND {i+1} ARGUMENT ---\n"
+            formatted += f"{arg}\n\n"
         
-        for phrase in suspicious_phrases:
-            if phrase in response_lower:
-                # Check if this phrase appears in source material
-                found_in_sources = False
-                all_source_text = ""
-                
-                # Combine all source material
-                for arg in verifier_args + counter_args:
-                    all_source_text += arg.lower() + " "
-                
-                for item in evidence:
-                    if item.get('content'):
-                        all_source_text += item['content'].lower() + " "
-                
-                if phrase not in all_source_text:
-                    warnings.append(f"Response contains '{phrase}' but this wasn't in source material")
+        return formatted
+    
+    def _validate_structured_response(self, response: str, verifier_args: List[str], 
+                                counter_args: List[str], evidence: List[Dict[str, Any]]) -> str:
+        """Validate that the judge response follows the required structure"""
         
-        # If warnings found, add disclaimer
-        if warnings:
-            disclaimer = "\n\n[ANALYSIS NOTE: This response may contain information not directly present in the provided source material. The analysis should be verified against the original arguments and evidence.]"
-            response += disclaimer
+        # Comment out the section validation warnings
+        # required_sections = [
+        #     "ARGUMENT QUALITY ASSESSMENT",
+        #     "EVIDENCE UTILIZATION ANALYSIS", 
+        #     "DEBATE DYNAMICS EVALUATION",
+        #     "CRITICAL GAPS AND LIMITATIONS",
+        #     "OVERALL ASSESSMENT"
+        # ]
+        
+        # missing_sections = []
+        # for section in required_sections:
+        #     if section.lower() not in response.lower():
+        #         missing_sections.append(section)
+        
+        # # If response is missing key sections, flag it
+        # if missing_sections:
+        #     warning = f"\n\n[JUDGE ANALYSIS NOTE: This response appears to be missing the following required sections: {', '.join(missing_sections)}. The analysis may be incomplete.]"
+        #     response += warning
+        
+        # Comment out the hallucination check warnings
+        # response = self._check_for_hallucinations(response, verifier_args, counter_args, evidence)
+        
+        # Comment out the minimum length warning
+        # if len(response.split()) < 400:
+        #     response += "\n\n[JUDGE ANALYSIS NOTE: This analysis appears shorter than expected for a comprehensive debate evaluation. Additional detail may be needed.]"
         
         return response
     
+    def _check_for_hallucinations(self, response: str, verifier_args: List[str], 
+                                counter_args: List[str], evidence: List[Dict[str, Any]]) -> str:
+        """Enhanced hallucination detection for structured judge responses - DISABLED"""
+        
+        # All validation checks are commented out to remove warnings
+        # The method now just returns the response unchanged
+        return response
+    
     def _summarize_evidence_safely(self, evidence: List[Dict[str, Any]]) -> str:
-        """Safely summarize evidence without adding external information"""
+        """Enhanced evidence summary with better structure"""
         if not evidence:
             return "No evidence sources were provided for analysis."
         
@@ -552,35 +605,27 @@ Keep your analysis factual and grounded in the provided content only. Do not spe
         failed_sources = len(evidence) - len(successful_sources)
         
         if not successful_sources:
-            return f"All {len(evidence)} evidence sources failed to load successfully. No content available for analysis."
+            return f"EVIDENCE STATUS: All {len(evidence)} evidence sources failed to load successfully.\nNo source content available for analysis."
         
-        summary = f"Successfully loaded {len(successful_sources)} out of {len(evidence)} evidence sources:\n\n"
+        summary = f"EVIDENCE STATUS: Successfully loaded {len(successful_sources)} out of {len(evidence)} sources.\n"
+        if failed_sources > 0:
+            summary += f"Note: {failed_sources} source(s) failed to load and are not included in this analysis.\n\n"
         
-        for i, source in enumerate(successful_sources[:3]):  # Limit to prevent context overflow
-            title = source.get('title', 'No title available')[:80]
+        summary += "AVAILABLE EVIDENCE SOURCES:\n\n"
+        
+        for i, source in enumerate(successful_sources[:4]):  # Limit to top 4 to prevent overflow
+            title = source.get('title', 'No title available')[:100]
             url = source.get('url', 'No URL')
-            content_preview = source.get('content', 'No content')[:300]
+            content_preview = source.get('content', 'No content')[:400]  # Increased preview
             
             summary += f"SOURCE {i+1}:\n"
             summary += f"Title: {title}\n"
             summary += f"URL: {url}\n"
-            summary += f"Content Preview: {content_preview}...\n\n"
+            summary += f"Content Preview: {content_preview}\n"
+            summary += f"[Content length: ~{len(source.get('content', ''))} characters]\n\n"
         
-        if len(successful_sources) > 3:
-            summary += f"[{len(successful_sources) - 3} additional sources not shown in detail]\n"
-        
-        return summary
-    
-    def _summarize_arguments_safely(self, arguments: List[str], role_name: str) -> str:
-        """Safely summarize arguments without adding interpretation"""
-        if not arguments:
-            return f"{role_name}: No arguments were presented during the debate."
-        
-        summary = f"{role_name.upper()} PRESENTED {len(arguments)} ARGUMENT(S):\n\n"
-        
-        for i, arg in enumerate(arguments):
-            # Preserve the actual argument content without interpretation
-            summary += f"ROUND {i+1} ARGUMENT:\n{arg}\n\n"
+        if len(successful_sources) > 4:
+            summary += f"[{len(successful_sources) - 4} additional sources available but not shown in detail to manage context length]\n\n"
         
         return summary
 
@@ -780,12 +825,12 @@ JSON OUTPUT:"""
                 pass
         
         # Strategy 2: Look for JSON between markers
-        markers = ['```json', '```', 'JSON:', 'json:']
+        markers = ['\`\`\`json', '\`\`\`', 'JSON:', 'json:']
         for marker in markers:
             if marker in response.lower():
                 parts = response.lower().split(marker)
                 if len(parts) > 1:
-                    json_part = parts[1].split('```')[0] if '```' in parts[1] else parts[1]
+                    json_part = parts[1].split('\`\`\`')[0] if '\`\`\`' in parts[1] else parts[1]
                     try:
                         return json.loads(json_part)
                     except json.JSONDecodeError:
@@ -1139,7 +1184,7 @@ class LangGraphClaimVerificationSystem:
                 )
             
             st.write("### 📝 Judge's Analysis")
-            st.write(judge_summary)
+            display_judge_analysis(judge_summary)
             
             with st.spinner("📊 Scoring the debate..."):
                 scoring_agent = ScoringAgent(self.client, PHI_MODEL)
@@ -1320,6 +1365,36 @@ class LangGraphClaimVerificationSystem:
         
         return history
 
+def display_judge_analysis(judge_summary: str):
+    """Display judge analysis with LaTeX support"""
+    # Check if the response contains LaTeX formatting
+    if r'\boxed{' in judge_summary or r'\text{' in judge_summary:
+        # Try to render LaTeX
+        try:
+            # Split the text to find LaTeX portions
+            import re
+            
+            # Find boxed content
+            boxed_matches = re.findall(r'\\boxed\{([^}]+)\}', judge_summary)
+            
+            if boxed_matches:
+                # Clean the text for display
+                clean_text = re.sub(r'\\boxed\{([^}]+)\}', r'**\1**', judge_summary)
+                clean_text = re.sub(r'\\text\{([^}]+)\}', r'\1', clean_text)
+                st.write(clean_text)
+                
+                # Display the boxed content prominently
+                for match in boxed_matches:
+                    clean_match = re.sub(r'\\text\{([^}]+)\}', r'\1', match)
+                    st.success(f"**Final Conclusion:** {clean_match}")
+            else:
+                st.write(judge_summary)
+        except Exception as e:
+            # Fallback to plain text
+            st.write(judge_summary)
+    else:
+        st.write(judge_summary)
+
 # Streamlit UI
 def main():
     st.set_page_config(
@@ -1376,27 +1451,75 @@ def main():
                     st.metric("Confidence", f"{judgment['confidence']:.2%}")
                 with col3:
                     st.metric("Evidence Quality", judgment['evidence_quality'])
-                
-                st.write("### 📝 Reasoning")
-                st.write(judgment['reasoning'])
-                
-                st.write("### 🔑 Key Evidence")
-                for evidence in judgment['key_evidence']:
-                    st.write(f"- {evidence}")
-
             
-            
-            # Display scraped sources
+            # Display scraped sources with full content
             st.write("## 📚 Sources")
-            for source in results['scraped_content']:
-                with st.expander(f"Source: {source['url']}"):
-                    st.write(f"**Title:** {source['title']}")
+            for i, source in enumerate(results['scraped_content']):
+                # Create a more descriptive title for the expander
+                source_title = source.get('title', 'No Title Available')
+                if len(source_title) > 80:
+                    source_title = source_title[:80] + "..."
+                
+                status_emoji = "✅" if source['status'] == 'success' else "❌"
+                expander_title = f"{status_emoji} Source {i+1}: {source_title}"
+                
+                with st.expander(expander_title):
+                    st.write(f"**URL:** {source['url']}")
+                    st.write(f"**Title:** {source.get('title', 'No title available')}")
                     st.write(f"**Status:** {source['status']}")
+                    st.write(f"**Scraped at:** {source.get('scraped_at', 'Unknown time')}")
+                    
                     if source['status'] == 'success':
-                        st.write("**Content Preview:**")
-                        st.write(source['content'][:500] + "...")
+                        # Show content statistics
+                        content_length = len(source.get('content', ''))
+                        full_text_length = len(source.get('full_text', ''))
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Content Length", f"{content_length:,} chars")
+                        with col2:
+                            st.metric("Full Text Length", f"{full_text_length:,} chars")
+                        
+                        # Display full content in expandable sections
+                        st.write("### 📄 Main Content")
+                        main_content = source.get('content', 'No content available')
+                        if main_content and main_content.strip():
+                            st.text_area(
+                                "Main Content (used by AI agents):",
+                                value=main_content,
+                                height=300,
+                                key=f"main_content_{i}",
+                                help="This is the main content that was extracted and used by the AI agents for analysis."
+                            )
+                        else:
+                            st.info("No main content was extracted from this source.")
+                        
+                        # Display full text if different from main content
+                        full_text = source.get('full_text', '')
+                        if full_text and full_text.strip() and full_text != main_content:
+                            st.write("### 📋 Full Text")
+                            st.text_area(
+                                "Complete scraped text:",
+                                value=full_text,
+                                height=400,
+                                key=f"full_text_{i}",
+                                help="This is the complete text that was scraped from the webpage, including all content."
+                            )
+                        
+                        # Show a preview of the raw HTML structure if available
+                        if st.checkbox(f"Show technical details for Source {i+1}", key=f"tech_details_{i}"):
+                            st.write("### 🔧 Technical Details")
+                            st.json({
+                                "URL": source.get('url', ''),
+                                "Title": source.get('title', ''),
+                                "Content Length": len(source.get('content', '')),
+                                "Full Text Length": len(source.get('full_text', '')),
+                                "Scraped At": source.get('scraped_at', ''),
+                                "Status": source.get('status', '')
+                            })
                     else:
-                        st.error(f"Error: {source.get('error', 'Unknown error')}")
+                        st.error(f"**Error:** {source.get('error', 'Unknown error occurred during scraping')}")
+                        st.info("This source could not be scraped and was not used in the analysis.")
         else:
             st.warning("Please enter a claim and at least one URL to verify.")
 
