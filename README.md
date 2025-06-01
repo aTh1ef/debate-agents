@@ -1,4 +1,4 @@
-# ⚖️ AI Claim Verification System
+# ⚖️ Agentic AI Debate System
 
 A Streamlit-based application that uses local LLMs and LangGraph orchestration to verify claims by scraping evidence from the web, simulating a multi-round debate, and producing a final structured judgment.
 
