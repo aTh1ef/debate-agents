@@ -1,0 +1,12 @@
+streamlit
+aiohttp
+beautifulsoup4
+requests
+urllib3
+openai
+langgraph
+langchain-core
+pydantic
+pandas
+python-dotenv
+typing-extensions
